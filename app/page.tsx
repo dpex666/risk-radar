@@ -1,307 +1,364 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
-import { usePostHog } from "posthog-js/react";
+import React, { useMemo, useState } from "react";
 
-type Answers = {
-  asset: string;
-  whyBought: string;
-  timeHorizon: "Days" | "Weeks" | "Months" | "Years";
-  whatChanged: "Nothing" | "Thesis broken" | "Price moved only" | "New info (good)" | "New info (bad)";
-  convictionNow: 1 | 2 | 3 | 4 | 5;
-  stressLevel: 1 | 2 | 3 | 4 | 5;
-  ifZeroOk: "Yes" | "No" | "Not sure";
+type CoinHit = {
+  id: string;
+  symbol: string;
+  name: string;
 };
 
-type Result = {
-  label: "Hold" | "Trim" | "Exit" | "Reassess";
-  headline: string;
+type MarketData = {
+  id: string;
+  symbol: string;
+  name: string;
+  image: string;
+  current_price: number;
+  market_cap: number;
+  market_cap_rank: number;
+  total_volume: number;
+
+  price_change_percentage_24h: number | null;
+  price_change_percentage_7d: number | null;
+  price_change_percentage_30d: number | null;
+
+  high_24h: number | null;
+  low_24h: number | null;
+  ath: number | null;
+  atl: number | null;
+};
+
+type RiskOutput = {
+  score: number; // 0–100
+  label: "Low" | "Medium" | "High" | "Chaos";
+  bias: "Hold" | "Watch" | "Reduce" | "Avoid";
+  drawdownPct: number | null;
   bullets: string[];
 };
 
-export default function Page() {
-  const posthog = usePostHog();
-
-  const [started, setStarted] = useState(false);
-  const [submitted, setSubmitted] = useState(false);
-
-  const [a, setA] = useState<Answers>({
-    asset: "",
-    whyBought: "",
-    timeHorizon: "Months",
-    whatChanged: "Nothing",
-    convictionNow: 3,
-    stressLevel: 3,
-    ifZeroOk: "Not sure",
+function fmtNum(n: number) {
+  return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+function fmtMoney(n: number) {
+  return n.toLocaleString(undefined, {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 2,
   });
+}
+function pct(n: number | null) {
+  if (n === null || Number.isNaN(n)) return "—";
+  const v = Math.round(n * 10) / 10;
+  const sign = v > 0 ? "+" : "";
+  return `${sign}${v}%`;
+}
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
 
-  const canSubmit =
-    a.asset.trim().length > 0 &&
-    a.whyBought.trim().length > 0;
+function riskColor(label: RiskOutput["label"]) {
+  switch (label) {
+    case "Low":
+      return "text-emerald-300 border-emerald-500/30 bg-emerald-500/10";
+    case "Medium":
+      return "text-yellow-300 border-yellow-500/30 bg-yellow-500/10";
+    case "High":
+      return "text-orange-300 border-orange-500/30 bg-orange-500/10";
+    case "Chaos":
+      return "text-rose-300 border-rose-500/30 bg-rose-500/10";
+  }
+}
 
-  const result: Result = useMemo(() => {
-    const thesisBroken = a.whatChanged === "Thesis broken" || a.whatChanged === "New info (bad)";
-    const highStress = a.stressLevel >= 4;
-    const lowConviction = a.convictionNow <= 2;
-    const notOkZero = a.ifZeroOk === "No";
-    const priceOnly = a.whatChanged === "Price moved only";
-    const nothingChanged = a.whatChanged === "Nothing";
+function scoreTextColor(label: RiskOutput["label"]) {
+  switch (label) {
+    case "Low":
+      return "text-emerald-400";
+    case "Medium":
+      return "text-yellow-400";
+    case "High":
+      return "text-orange-400";
+    case "Chaos":
+      return "text-rose-400";
+  }
+}
 
-    // Heuristics (intentionally simple)
-    if (thesisBroken) {
-      return {
-        label: "Exit",
-        headline: "If the thesis is broken, stop negotiating with yourself.",
-        bullets: [
-          "You don’t need a perfect exit. You need consistency.",
-          "Write the new thesis. If you can’t, you’re holding hope.",
-          "Re-enter later if the facts change.",
-        ],
+function biasColor(bias: RiskOutput["bias"]) {
+  switch (bias) {
+    case "Hold":
+      return "text-emerald-300 border-emerald-500/30 bg-emerald-500/10";
+    case "Watch":
+      return "text-sky-300 border-sky-500/30 bg-sky-500/10";
+    case "Reduce":
+      return "text-orange-300 border-orange-500/30 bg-orange-500/10";
+    case "Avoid":
+      return "text-rose-300 border-rose-500/30 bg-rose-500/10";
+  }
+}
+
+function getRiskOutput(d: MarketData): RiskOutput {
+  const abs24 = Math.abs(d.price_change_percentage_24h ?? 0);
+
+  // Liquidity proxy: volume / market cap
+  const liq = d.market_cap > 0 ? d.total_volume / d.market_cap : 0;
+
+  // Rank proxy (higher rank number = generally riskier)
+  const rank = d.market_cap_rank || 9999;
+
+  // Drawdown from ATH (%)
+  let drawdownPct: number | null = null;
+  if (d.ath != null && d.ath > 0) {
+    drawdownPct = Math.round(((d.ath - d.current_price) / d.ath) * 100);
+  }
+
+  // Score components
+  let score = 0;
+
+  // Volatility shock (0–40)
+  score += clamp(abs24 * 2.5, 0, 40);
+
+  // Rank risk (0–35)
+  if (rank <= 20) score += 5;
+  else if (rank <= 50) score += 12;
+  else if (rank <= 100) score += 20;
+  else if (rank <= 250) score += 28;
+  else score += 35;
+
+  // Liquidity risk (0–25)
+  if (liq < 0.02) score += 25;
+  else if (liq < 0.05) score += 18;
+  else if (liq < 0.1) score += 10;
+  else if (liq < 0.2) score += 6;
+  else score += 3;
+
+  // Drawdown from ATH (0–30)
+  if (drawdownPct !== null) score += clamp(drawdownPct / 2, 0, 30);
+
+  score = clamp(Math.round(score), 0, 100);
+
+  let label: RiskOutput["label"] = "Medium";
+  if (score <= 25) label = "Low";
+  else if (score <= 50) label = "Medium";
+  else if (score <= 75) label = "High";
+  else label = "Chaos";
+
+  // Bias (simple + punchy)
+  let bias: RiskOutput["bias"] = "Watch";
+  if (label === "Low" && drawdownPct !== null && drawdownPct < 20) bias = "Hold";
+  else if (label === "Medium") bias = "Watch";
+  else if (label === "High") bias = "Reduce";
+  else bias = "Avoid";
+
+  const bullets: string[] = [];
+  bullets.push(`24h move: ${pct(d.price_change_percentage_24h)} (bigger swings = higher risk).`);
+
+  if (rank <= 20) bullets.push(`Market cap rank #${fmtNum(rank)} (more established).`);
+  else bullets.push(`Market cap rank #${fmtNum(rank)} (higher tail risk).`);
+
+  if (liq < 0.05) bullets.push("Liquidity looks thin (volume vs market cap is low).");
+  else bullets.push("Liquidity looks reasonable (easier exits).");
+
+  if (drawdownPct !== null) bullets.push(`Down ${drawdownPct}% from ATH (distance matters).`);
+
+  if (d.price_change_percentage_7d != null) bullets.push(`7d move: ${pct(d.price_change_percentage_7d)}.`);
+  if (d.price_change_percentage_30d != null) bullets.push(`30d move: ${pct(d.price_change_percentage_30d)}.`);
+
+  if (label === "Chaos") bullets.push("If this nukes 30% overnight, that’s normal for this profile.");
+  if (label === "Low") bullets.push("This is still crypto. Low risk here just means ‘less insane’.");
+
+  return { score, label, bias, drawdownPct, bullets };
+}
+
+function Stat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4">
+      <div className="text-xs text-zinc-500">{label}</div>
+      <div className="mt-1 text-sm font-medium text-zinc-100">{value}</div>
+    </div>
+  );
+}
+
+export default function Page() {
+  const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [hit, setHit] = useState<CoinHit | null>(null);
+  const [data, setData] = useState<MarketData | null>(null);
+
+  const canSearch = query.trim().length >= 2;
+
+  async function searchAndFetch() {
+    setErr(null);
+    setLoading(true);
+    setData(null);
+    setHit(null);
+
+    try {
+      const q = query.trim();
+
+      const res = await fetch(`/api/coingecko?q=${encodeURIComponent(q)}`, {
+        cache: "no-store",
+      });
+
+      const json = await res.json();
+
+      if (!res.ok) {
+        throw new Error(json?.error || "Fetch failed");
+      }
+
+      const chosen = json.chosen as CoinHit;
+      const row = json.row;
+
+      setHit(chosen);
+
+      const parsed: MarketData = {
+        id: row.id,
+        symbol: String(row.symbol || "").toUpperCase(),
+        name: String(row.name || ""),
+        image: String(row.image || ""),
+        current_price: Number(row.current_price),
+        market_cap: Number(row.market_cap),
+        market_cap_rank: Number(row.market_cap_rank),
+        total_volume: Number(row.total_volume),
+
+        price_change_percentage_24h:
+          row.price_change_percentage_24h_in_currency ?? row.price_change_percentage_24h ?? null,
+        price_change_percentage_7d: row.price_change_percentage_7d_in_currency ?? null,
+        price_change_percentage_30d: row.price_change_percentage_30d_in_currency ?? null,
+
+        high_24h: row.high_24h ?? null,
+        low_24h: row.low_24h ?? null,
+        ath: row.ath ?? null,
+        atl: row.atl ?? null,
       };
+
+      setData(parsed);
+    } catch (e: any) {
+      setErr(e?.message || "Something went wrong.");
+    } finally {
+      setLoading(false);
     }
+  }
 
-    if ((highStress && notOkZero) || (highStress && lowConviction)) {
-      return {
-        label: "Trim",
-        headline: "Your position is too big for your nervous system.",
-        bullets: [
-          "Stress is data. If you can’t hold it, you’re overexposed.",
-          "Trim until you can think clearly again.",
-          "Keep a small runner only if the thesis still stands.",
-        ],
-      };
-    }
+  const changeClass = useMemo(() => {
+    if (!data || data.price_change_percentage_24h == null) return "text-zinc-300";
+    return data.price_change_percentage_24h >= 0 ? "text-emerald-400" : "text-rose-400";
+  }, [data]);
 
-    if (priceOnly && a.timeHorizon !== "Days") {
-      return {
-        label: "Reassess",
-        headline: "You’re reacting to candles, not information.",
-        bullets: [
-          "If nothing fundamental changed, don’t turn this into a new trade.",
-          "Re-read why you bought. If it still holds, chill.",
-          "If you can’t explain the thesis, reduce and reset.",
-        ],
-      };
-    }
-
-    if (nothingChanged && a.convictionNow >= 4 && a.timeHorizon !== "Days") {
-      return {
-        label: "Hold",
-        headline: "Nothing changed and conviction is high. Don’t sabotage it.",
-        bullets: [
-          "Most losses come from bad behaviour, not bad picks.",
-          "Set a simple invalidation rule and stop staring at it.",
-          "If you need action: plan partial take-profits, not panic sells.",
-        ],
-      };
-    }
-
-    // Default
-    return {
-      label: "Reassess",
-      headline: "You’re not stuck. You’re missing a rule.",
-      bullets: [
-        "Define: what would make you sell (invalidation).",
-        "If you can’t define it, reduce risk until you can.",
-        "Then stop asking the market to make decisions for you.",
-      ],
-    };
-  }, [a]);
-
-  // Analytics (only fires if PostHog key is set)
-  useEffect(() => {
-    if (!submitted) return;
-    posthog?.capture("result_viewed", {
-      label: result.label,
-      horizon: a.timeHorizon,
-      changed: a.whatChanged,
-      conviction: a.convictionNow,
-      stress: a.stressLevel,
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [submitted]);
+  const risk = useMemo(() => (data ? getRiskOutput(data) : null), [data]);
 
   return (
     <main className="min-h-screen bg-zinc-950 text-zinc-100">
       <div className="mx-auto max-w-2xl px-5 py-10">
-        {/* HERO */}
         <div className="mb-8">
-          <h1 className="text-3xl font-semibold tracking-tight">Should I sell?</h1>
+          <h1 className="text-3xl font-semibold tracking-tight">Risk Radar</h1>
           <p className="mt-2 text-zinc-300">
-            A fast decision check. No predictions. No advice. Just clarity.
+            Type a coin. Get live market context. (No predictions, no advice.)
           </p>
+        </div>
 
-          {!started && (
+        <div className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
+          <div className="mb-2 text-xs text-zinc-500">Coin symbol or name</div>
+          <div className="flex gap-3">
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="BTC, SOL, Ethereum..."
+              className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-zinc-600"
+            />
             <button
-              onClick={() => {
-                setStarted(true);
-                posthog?.capture("start_clicked");
-              }}
-              className="mt-5 rounded-xl bg-zinc-100 px-4 py-3 text-sm font-medium text-zinc-900 hover:bg-white"
+              onClick={searchAndFetch}
+              disabled={!canSearch || loading}
+              className="rounded-xl bg-zinc-100 px-4 py-2 text-sm font-medium text-zinc-900 hover:bg-white disabled:cursor-not-allowed disabled:opacity-40"
             >
-              Start
+              {loading ? "..." : "Scan"}
             </button>
+          </div>
+
+          {err && <div className="mt-3 text-sm text-rose-300">{err}</div>}
+
+          {hit && !data && !loading && (
+            <div className="mt-4 text-sm text-zinc-300">
+              Found: <span className="text-zinc-100">{hit.name}</span> ({hit.symbol})
+            </div>
           )}
         </div>
 
-        {/* FORM */}
-        {started && (
-          <div className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
-            <div className="space-y-4">
-              <Field label="Asset">
-                <input
-                  value={a.asset}
-                  onChange={(e) => setA((p) => ({ ...p, asset: e.target.value }))}
-                  placeholder="e.g., BTC / SOL / PEPE"
-                  className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-zinc-600"
-                />
-              </Field>
-
-              <Field label="Why did you buy? (one sentence)">
-                <input
-                  value={a.whyBought}
-                  onChange={(e) => setA((p) => ({ ...p, whyBought: e.target.value }))}
-                  placeholder="e.g., ETF inflows + long-term adoption"
-                  className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-zinc-600"
-                />
-              </Field>
-
-              <Field label="Time horizon">
-                <select
-                  value={a.timeHorizon}
-                  onChange={(e) => setA((p) => ({ ...p, timeHorizon: e.target.value as Answers["timeHorizon"] }))}
-                  className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-zinc-600"
-                >
-                  <option>Days</option>
-                  <option>Weeks</option>
-                  <option>Months</option>
-                  <option>Years</option>
-                </select>
-              </Field>
-
-              <Field label="What changed since you bought?">
-                <select
-                  value={a.whatChanged}
-                  onChange={(e) => setA((p) => ({ ...p, whatChanged: e.target.value as Answers["whatChanged"] }))}
-                  className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-zinc-600"
-                >
-                  <option>Nothing</option>
-                  <option>Price moved only</option>
-                  <option>New info (good)</option>
-                  <option>New info (bad)</option>
-                  <option>Thesis broken</option>
-                </select>
-              </Field>
-
-              <Field label="Conviction right now (1–5)">
-                <Range value={a.convictionNow} onChange={(v) => setA((p) => ({ ...p, convictionNow: v }))} />
-              </Field>
-
-              <Field label="Stress level (1–5)">
-                <Range value={a.stressLevel} onChange={(v) => setA((p) => ({ ...p, stressLevel: v }))} />
-              </Field>
-
-              <Field label="If this goes to zero, are you genuinely OK?">
-                <select
-                  value={a.ifZeroOk}
-                  onChange={(e) => setA((p) => ({ ...p, ifZeroOk: e.target.value as Answers["ifZeroOk"] }))}
-                  className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-zinc-600"
-                >
-                  <option>Yes</option>
-                  <option>No</option>
-                  <option>Not sure</option>
-                </select>
-              </Field>
-
-              <div className="pt-2 flex gap-3">
-                <button
-                  disabled={!canSubmit}
-                  onClick={() => {
-                    setSubmitted(true);
-                    posthog?.capture("submit_clicked", {
-                      horizon: a.timeHorizon,
-                      changed: a.whatChanged,
-                      conviction: a.convictionNow,
-                      stress: a.stressLevel,
-                      ifZeroOk: a.ifZeroOk,
-                    });
-                  }}
-                  className="w-full rounded-xl bg-zinc-100 px-4 py-3 text-sm font-medium text-zinc-900 hover:bg-white disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  Give me the call
-                </button>
-
-                {submitted && (
-                  <button
-                    onClick={() => setSubmitted(false)}
-                    className="rounded-xl border border-zinc-700 bg-zinc-900 px-4 py-3 text-sm hover:bg-zinc-800"
-                  >
-                    Reset
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* RESULT */}
-        {submitted && (
+        {data && (
           <div className="mt-6 rounded-2xl border border-zinc-800 bg-zinc-900/40 p-5">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <h3 className="text-base font-medium">Call: {result.label}</h3>
-                <p className="mt-1 text-zinc-300">{result.headline}</p>
+            {risk && (
+              <div className="mb-5 rounded-2xl border border-zinc-800 bg-zinc-950 p-5">
+                <div className="flex items-center justify-between gap-4">
+  <div>
+    <div className="text-xs text-zinc-500">Risk score</div>
+
+    <div className={`mt-1 text-2xl font-semibold ${scoreTextColor(risk.label)}`}>
+      {risk.score} <span className="text-base text-zinc-500">/ 100</span>
+    </div>
+
+    {/* 👇 ADD IT RIGHT HERE */}
+    <div className="mt-2 text-xs text-zinc-500">
+      This is a snapshot. Re-run only if facts change.
+    </div>
+  </div>
+
+  <div className="flex items-center gap-2">
+    <div className={`rounded-xl border px-3 py-2 text-sm font-medium ${riskColor(risk.label)}`}>
+      {risk.label}
+    </div>
+    <div className={`rounded-xl border px-3 py-2 text-sm font-medium ${biasColor(risk.bias)}`}>
+      Bias: {risk.bias}
+    </div>
+  </div>
+</div>
+
+
+                <div className="mt-4 space-y-2 text-sm text-zinc-300">
+                  {risk.bullets.map((b, i) => (
+                    <div key={i} className="flex gap-2">
+                      <span className="text-zinc-500">•</span>
+                      <span>{b}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
-              <div className="rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-300">
-                Conviction: <span className="text-zinc-100">{a.convictionNow}/5</span>
+            )}
+
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                {data.image ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={data.image} alt={data.name} className="h-9 w-9 rounded-full" />
+                ) : null}
+                <div>
+                  <div className="text-base font-medium">
+                    {data.name} <span className="text-zinc-500">({data.symbol})</span>
+                  </div>
+                  <div className="text-xs text-zinc-500">Rank #{fmtNum(data.market_cap_rank)}</div>
+                </div>
+              </div>
+
+              <div className="text-right">
+                <div className="text-lg font-semibold">{fmtMoney(data.current_price)}</div>
+                <div className={`text-sm ${changeClass}`}>{pct(data.price_change_percentage_24h)} (24h)</div>
               </div>
             </div>
 
-            <ul className="mt-4 space-y-2 text-sm text-zinc-300">
-              {result.bullets.map((b, i) => (
-                <li key={i} className="flex gap-2">
-                  <span className="text-zinc-500">•</span>
-                  <span>{b}</span>
-                </li>
-              ))}
-            </ul>
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <Stat label="24h High" value={data.high_24h == null ? "—" : fmtMoney(data.high_24h)} />
+              <Stat label="24h Low" value={data.low_24h == null ? "—" : fmtMoney(data.low_24h)} />
+              <Stat label="Market Cap" value={fmtMoney(data.market_cap)} />
+              <Stat label="24h Volume" value={fmtMoney(data.total_volume)} />
+              <Stat label="ATH" value={data.ath == null ? "—" : fmtMoney(data.ath)} />
+              <Stat label="ATL" value={data.atl == null ? "—" : fmtMoney(data.atl)} />
+            </div>
 
             <div className="mt-5 rounded-xl border border-zinc-800 bg-zinc-950 p-4 text-xs text-zinc-500">
-              Not financial advice. This is a decision framework.
+              Data source: CoinGecko. Not financial advice.
             </div>
           </div>
         )}
-
-        <div className="mt-8 text-xs text-zinc-500">
-          built by dpex666 — ship fast, stay sane
-        </div>
       </div>
     </main>
-  );
-}
-
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div>
-      <div className="mb-1 text-xs text-zinc-500">{label}</div>
-      {children}
-    </div>
-  );
-}
-
-function Range({ value, onChange }: { value: 1 | 2 | 3 | 4 | 5; onChange: (v: 1 | 2 | 3 | 4 | 5) => void }) {
-  return (
-    <div className="flex items-center gap-3">
-      <input
-        type="range"
-        min={1}
-        max={5}
-        step={1}
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value) as 1 | 2 | 3 | 4 | 5)}
-        className="w-full"
-      />
-      <div className="w-10 text-right text-sm text-zinc-200">{value}</div>
-    </div>
   );
 }
